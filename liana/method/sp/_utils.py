@@ -4,6 +4,12 @@ import numpy as np
 from scipy.sparse import csr_matrix, isspmatrix_csr, hstack
 from anndata import AnnData
 
+def _rename_means(lr_stats, entity):
+    df = lr_stats.copy()
+    df.columns = df.columns.map(lambda x: entity + '_' + str(x) if x != 'gene' else 'gene')
+    return df.rename(columns={'gene': entity})
+
+
 def _add_complexes_to_var(adata, entities, complex_sep='_'):
     """
     Generate an AnnData object with complexes appended as variables.
@@ -56,8 +62,3 @@ def _spatialdm_weight_norm(weight):
     norm_factor = weight.shape[0] / weight.sum()
     weight = norm_factor * weight
     return weight
-
-def _rename_means(lr_stats, entity):
-    df = lr_stats.copy()
-    df.columns = df.columns.map(lambda x: entity + '_' + str(x) if x != 'gene' else 'gene')
-    return df.rename(columns={'gene': entity})
