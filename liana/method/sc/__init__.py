@@ -7,3 +7,4 @@ from ._singlecellsignalr import singlecellsignalr
 from ._scseqcomm import scseqcomm
 from ._geometric_mean import geometric_mean
 from ._cellchat import cellchat
+from ._compute_global_score import compute_global_score

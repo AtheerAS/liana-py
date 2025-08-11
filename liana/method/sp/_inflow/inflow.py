@@ -6,7 +6,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 from scipy.sparse import csr_matrix
-
+from sklearn.utils.sparsefuncs import mean_variance_axis
 import liana as li
 from liana.method._pipe_utils._common import _get_props
 from liana.method.sp._utils import _add_complexes_to_var, _rename_means
@@ -173,19 +173,51 @@ class SpatialInflow():
         k = ct.shape[1]           # number of cell types
         m = x_mat.shape[1]       # number of LR pairs
 
-        # Expand ligand expression by cell types
-        l = np.expand_dims(x_mat.toarray(), axis=1)     # shape: (n_cells, 1, n_LRs)
-        s = np.expand_dims(ct.toarray(), axis=2)        # shape: (n_cells, n_ct, 1)
-        ls = np.multiply(l, s).reshape((x_mat.shape[0], m * k))
+        from scipy.sparse import hstack
+
+        # Initialize empty list to hold each (cell x ligand) matrix per celltype
+        ls_list = []
+
+        # Loop over each cell type column in `ct` (a sparse binary matrix)
+        for i in range(ct.shape[1]):
+            # Slice the indicator column for one cell type: (n_cells, 1)
+            ct_i = ct[:, i]
+            
+            # Elementwise multiply x_mat (ligand expr) with cell type indicator
+            # This will zero out cells not in this cell type
+            ls_i = x_mat.multiply(ct_i)
+
+            ls_list.append(ls_i)
+
+        # Horizontally stack to simulate (n_cells, n_celltypes * n_ligands)
+        ls = hstack(ls_list)  # shape: (n_cells, k * m)
 
         # Min-max transform the ligand * celltype data & apply spatial weighting
-        ls = self._transform(ls, transform, **kwargs)
-        wls = w.dot(csr_matrix(ls)).toarray()
-        wls /= w.sum(axis=1)  # normalize by row sum
-        wls[np.isnan(wls)] = 0
+        if not isinstance(ls, csr_matrix):
+            ls = csr_matrix(ls)
+            
+        wls = w.dot(ls)
+
+        # Normalize by row sums (avoid division by zero)
+        row_sums = np.asarray(w.sum(axis=1)).flatten()
+        row_sums[row_sums == 0] = 1.0  # avoid division by zero
+        inv_row_sums = 1.0 / row_sums
+        wls = wls.multiply(inv_row_sums[:, None])  # still sparse
+
+        # Clean NaNs in sparse matrix (if any)
+        wls.data[np.isnan(wls.data)] = 0
+
+        # Transform receptor matrix
         r = self._transform(y_mat, transform, **kwargs)
-        ri = np.tile(r, k)
-        xy_mat = wls * ri
+
+        # Ensure r is sparse and repeat across cell types
+        if not isinstance(r, csr_matrix):
+            r = csr_matrix(r)
+        ri = hstack([r] * k)  # replicate across k cell types - changed
+
+        # Sparse elementwise multiplication
+        xy_mat = wls.multiply(ri)  # both are sparse
+
 
         # Create .var index: each column is "cell_type ^ interaction_name"
         var = pd.DataFrame(
@@ -198,7 +230,7 @@ class SpatialInflow():
 
         # Construct the output AnnData
         lrdata = sc.AnnData(
-            X=xy_mat,
+            X=csr_matrix(xy_mat),
             var=var,
             obs=adata.obs,
             uns=adata.uns,
@@ -208,33 +240,15 @@ class SpatialInflow():
         )
 
         # Drop non-variable features
-        lrdata = lrdata[:, lrdata.X.var(axis=0) > 0]
+        _, var = mean_variance_axis(lrdata.X, axis=0)
+        lrdata = lrdata[:, var > 0]
         
-        ## Global Values
-        celltype_names = list(celltypes.columns.values) # k
-        interaction_names = lrdata.var.index # s x l x r
-
-        t = ct.toarray() # k, n
-        t = t / t.sum(axis=0) # NOTE: scaled by the sum of each cell type
-
-        values = (t.T @ lrdata.X) # k x (s*l*r); i.e. we sum over n
-        values = values.flatten()
-
-        res = pd.DataFrame({
-            'name': np.tile(interaction_names, k)+ xy_sep + np.repeat(celltype_names, interaction_names.shape[0]),
-            'value': values
-        })
-
-        return res, lrdata
+        return lrdata
     
     def _transform(self, mat, transform=None, **kwargs):
         if transform is not None:
-            mat = transform(mat, **kwargs)
-        if isinstance(mat, csr_matrix):
-            return mat.toarray()
-        elif isinstance(mat, np.ndarray):
-            return mat
-        else:
-            raise TypeError(f"Unsupported matrix type: {type(mat)}. Expected np.ndarray or csr_matrix.")
+            return transform(mat, **kwargs)
+        return mat
+
 
 inflow = SpatialInflow()
