@@ -8,3 +8,4 @@ from ._scseqcomm import scseqcomm
 from ._geometric_mean import geometric_mean
 from ._cellchat import cellchat
 from ._compute_global_score import compute_global_score
+from liana.method.sc._lrdata_to_mudata import lrdata_to_mudata
