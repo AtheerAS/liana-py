@@ -45,7 +45,6 @@ def lrdata_to_mudata(
     filter_views: bool = True,
     min_genes: int = 5,
     min_cells: int = 5,
-    strip_prefix: bool = True,
     verbose: bool = True,
 ) -> mu.MuData:
     """
@@ -73,8 +72,6 @@ def lrdata_to_mudata(
         Minimum genes per cell when filtering.
     min_cells : int
         Minimum cells per gene when filtering.
-    strip_prefix : bool
-        If True, remove the "<raw_prefix>^" from each view’s var_names.
     verbose : bool
         If True, print progress and summary stats.
 
@@ -123,12 +120,6 @@ def lrdata_to_mudata(
             continue
 
         view_data = lrdata[:, matching_vars].copy()
-
-        if strip_prefix:
-            # Remove ONLY the leading "<raw_prefix>^"
-            pattern = rf"^{re.escape(raw_prefix)}\^"
-            view_data.var_names = view_data.var_names.to_series().str.replace(pattern, "", regex=True).values
-
         views[clean_prefix] = view_data
 
         if verbose:
