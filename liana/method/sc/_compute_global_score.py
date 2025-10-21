@@ -75,7 +75,7 @@ def compute_global_score(
     groupby: str,
     xy_sep: str = V.lr_sep,
     complex_sep: str = "_",
-    n_perms: int = 1000,
+    n_perms: int = 500,
     seed: int = 42,
     n_jobs: int = -1,
 ) -> None:
@@ -87,7 +87,7 @@ def compute_global_score(
         groupby (str): The grouping column (cell type) in `lrdata.obs`.
         xy_sep (str, optional): Separator for names. Defaults to `V.lr_sep` ('^').
         complex_sep (str, optional): Separator for splitting complex names. Defaults to "_".
-        n_perms (int, optional): Number of permutations for p-value calculation. Defaults to 1000.
+        n_perms (int, optional): Number of permutations for p-value calculation. Defaults to 500.
         seed (int, optional): Random seed for reproducibility. Defaults to 42.
         n_jobs (int, optional): Number of parallel jobs. Defaults to -1 (all processors).
 
