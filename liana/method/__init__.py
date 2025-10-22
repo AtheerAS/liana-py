@@ -2,7 +2,8 @@ import numpy as np
 
 from liana.method.sc._Method import Method, MethodMeta, _show_methods
 from liana.method.sc._rank_aggregate import AggregateClass, _rank_aggregate_meta as aggregate_meta
-from liana.method.sc import cellphonedb, connectome, logfc, natmi, singlecellsignalr, geometric_mean, cellchat, scseqcomm, compute_global_score, lrdata_to_mudata
+from liana.method.sc import cellphonedb, connectome, logfc, natmi, singlecellsignalr, geometric_mean, cellchat, scseqcomm, compute_global_score, lrdata_to_mudata, cell_type_spatial_proximity
+
 
 from liana.method.sp import bivariate, genericMistyData, lrMistyData, MistyData, inflow
 from liana.method.fun._causalnet import find_causalnet, build_prior_network
