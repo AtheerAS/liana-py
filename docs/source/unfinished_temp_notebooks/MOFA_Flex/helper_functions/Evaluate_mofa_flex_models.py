@@ -1,415 +1,409 @@
-# Cell 1: Imports
 from pathlib import Path
+import os
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import itertools
-
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from sklearn.neighbors import NearestNeighbors
-from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix,
-    roc_auc_score, silhouette_score,
-    normalized_mutual_info_score, adjusted_mutual_info_score,
-    homogeneity_score, adjusted_rand_score
-)
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
+import json
 
 import matplotlib.pyplot as plt
-from plotnine import ggplot
-import mofaflex as mfl
+from sklearn.metrics import (
+    normalized_mutual_info_score,
+    adjusted_mutual_info_score,
+    homogeneity_score,
+    adjusted_rand_score,
+    silhouette_score,
+)
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    roc_auc_score,
+    roc_curve,
+    confusion_matrix,
+)
 
-#Utility Functions
-def _ensure_dir(p):
-    p = Path(p)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
 
 def spatial_coherence_score(X, labels, k=5):
     X = np.asarray(X)
     labels = np.asarray(labels)
-    nbrs = NearestNeighbors(n_neighbors=k + 1).fit(X)
+
+    nbrs = NearestNeighbors(n_neighbors=k+1).fit(X)
     _, indices = nbrs.kneighbors(X)
+
+    # exclude each point itself (indices[:,0])
     indices = indices[:, 1:]
+    
     same_cluster_counts = np.sum(labels[indices] == labels[:, None], axis=1)
     scs = np.mean(same_cluster_counts / k)
     return scs
 
-def save_plot_object(fig, path):
-    if isinstance(fig, ggplot):
-        fig.save(path, dpi=300)
-    else:
-        fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-# Cell 3: Evaluate single MOFA model outputs (plots + R2)
-def evaluate_single_mofa_model(model, output_dir, group="group_1", show_plots=False):
+
+def evaluate_mofaflex(
+    model,
+    lrdata,
+    output_dir,
+    group="group_1",
+    n_clusters=None,
+    obs_keys=("cell_type", "major_brain_region"),
+    classification_key=None,
+    spatial_key="X_spatial_coords",
+    random_state=42,
+):
+    """
+    Run a benchmarking pipeline for a MOFA-FLEX model and save results & figures.
+
+    Parameters
+    - model: MOFAFLEX model object (must implement get_factors(), get_weights(), get_r2()).
+    - lrdata: AnnData-like object with .obs and .obsm available.
+    - output_dir: str or Path where outputs (csv, figs, reports) will be saved.
+    - group: group name used when calling model.get_factors()[group].
+    - n_clusters: iterable of ints (cluster counts). If None, uses range(2,10).
+    - obs_keys: tuple/list of observation keys from lrdata.obs to use for baselines/metrics.
+    - classification_key: key in lrdata.obs to use for regression/classification (optional).
+    - spatial_key: key in lrdata.obsm storing spatial coordinates (default "X_spatial_coords").
+    - random_state: random seed for clustering / classifiers.
+
+    Returns:
+    - dict with paths to saved files and results DataFrame under "results_df".
+    """
     out = {}
-    out_dir = _ensure_dir(output_dir)
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        fig = mfl.pl.factor_correlation(model)
-        p = out_dir / "factor_correlation.png"
-        save_plot_object(fig, p)
-        out["factor_correlation_path"] = str(p)
-    except Exception as e:
-        out["factor_correlation_error"] = str(e)
+    if n_clusters is None:
+        n_clusters = list(range(2, 10))
+    else:
+        n_clusters = list(n_clusters)
 
-    try:
-        fig = mfl.pl.variance_explained(model, figsize=(8, 8))
-        p = out_dir / "variance_explained.png"
-        save_plot_object(fig, p)
-        out["variance_explained_path"] = str(p)
-    except Exception as e:
-        out["variance_explained_error"] = str(e)
+    # 1) Factors and alignment with lrdata
+    factors_all = model.get_factors()
+    if group not in factors_all:
+        raise KeyError(f"group '{group}' not found in model factors")
+    factors = factors_all[group].copy()
 
-    try:
-        r2 = model.get_r2(total=True)
-        out["mean_r2"] = float(r2[group].mean())
-    except Exception as e:
-        out["mean_r2_error"] = str(e)
+    # intersect indices and subset
+    common_idx = lrdata.obs.index.intersection(factors.index)
+    factors = factors.loc[common_idx]
+    # standardize factor values for clustering/classification
+    X = StandardScaler().fit_transform(factors.values)
 
-    return out
-# Cell 4: Plot weights distribution
-def plot_weights_distribution(model, output_dir):
-    out_dir = _ensure_dir(output_dir)
+    # ensure spatial coords aligned to lrdata.obs
+    spatial_coords = np.asarray(lrdata.obsm[spatial_key])
+    if spatial_coords.shape[0] != lrdata.obs.shape[0]:
+        raise ValueError("spatial coords length does not match lrdata.obs length")
+
+    # helper to compute baseline metrics per obs_key (dropna)
+    def _baseline_spatial_and_silhouette(obs_key):
+        labels = lrdata.obs[obs_key].astype(str).values
+        mask = pd.notna(labels)
+        labels_f = labels[mask]
+        coords_f = spatial_coords[mask]
+        scs = spatial_coherence_score(coords_f, labels_f, k=3)
+        try:
+            sil = silhouette_score(coords_f, labels_f)
+        except Exception:
+            sil = float("nan")
+        return float(scs), float(sil)
+
+    # baseline pairwise metrics between first two obs_keys if available
+    baseline_pair = {}
+    if len(obs_keys) >= 2:
+        a = lrdata.obs[obs_keys[0]].astype(str).values
+        b = lrdata.obs[obs_keys[1]].astype(str).values
+        mask = pd.notna(a) & pd.notna(b)
+        if mask.sum() > 0:
+            baseline_pair["nmi"] = float(normalized_mutual_info_score(a[mask], b[mask]))
+            baseline_pair["ami"] = float(adjusted_mutual_info_score(a[mask], b[mask]))
+            baseline_pair["homogeneity"] = float(homogeneity_score(a[mask], b[mask]))
+            baseline_pair["ari"] = float(adjusted_rand_score(a[mask], b[mask]))
+        else:
+            baseline_pair = {"nmi": np.nan, "ami": np.nan, "homogeneity": np.nan, "ari": np.nan}
+
+    # compute baselines per obs_key
+    baselines = {}
+    for k in obs_keys:
+        scs, sil = _baseline_spatial_and_silhouette(k)
+        baselines[f"baseline_spatial_coherence_{k}"] = scs
+        baselines[f"baseline_silhouette_{k}"] = sil
+
+    if baseline_pair:
+        baselines.update(
+            {
+                f"baseline_nmi_{obs_keys[0]}_vs_{obs_keys[1]}": baseline_pair["nmi"],
+                f"baseline_ami_{obs_keys[0]}_vs_{obs_keys[1]}": baseline_pair["ami"],
+                f"baseline_homogeneity_{obs_keys[0]}_vs_{obs_keys[1]}": baseline_pair["homogeneity"],
+                f"baseline_ari_{obs_keys[0]}_vs_{obs_keys[1]}": baseline_pair["ari"],
+            }
+        )
+
+    # 2) Clustering evaluation across cluster counts
+    results = []
+    idx_lr = lrdata.obs.index  # full index for lrdata
+    for k in n_clusters:
+        km = KMeans(n_clusters=k, random_state=random_state)
+        preds = km.fit_predict(X)  # aligned to factors.index
+        preds_series = pd.Series(preds, index=factors.index, name=f"cluster_{k}")
+
+        # add to factors and lrdata (only for matching idx)
+        factors[f"cluster_{k}"] = preds_series
+        preds_lr = preds_series.reindex(idx_lr)
+        lrdata.obs[f"cluster_{k}"] = preds_lr.values
+
+        # prepare mask to exclude NaNs (cells without cluster assignment)
+        labels_full = lrdata.obs[f"cluster_{k}"]
+        mask = pd.notna(labels_full)
+        labels = labels_full[mask].astype(str).values
+        coords = spatial_coords[mask.values]
+
+        # spatial coherence (k=3) and silhouette (on spatial coords)
+        scs_clusters = float(spatial_coherence_score(coords, labels, k=3)) if coords.shape[0] > 0 else np.nan
+        try:
+            sil_clusters = float(silhouette_score(coords, labels)) if coords.shape[0] > 0 else np.nan
+        except Exception:
+            sil_clusters = float("nan")
+
+        # agreement metrics vs each obs_key
+        row = {
+            "n_clusters": int(k),
+            "n_cells": int(len(lrdata.obs)),
+            "largest_cluster_size": int(lrdata.obs[f"cluster_{k}"].value_counts(dropna=True).max()),
+            "smallest_cluster_size": int(lrdata.obs[f"cluster_{k}"].value_counts(dropna=True).min()),
+            "n_unique_clusters_assigned": int(lrdata.obs[f"cluster_{k}"].value_counts(dropna=True).size),
+            "spatial_coherence_clusters_k3": scs_clusters,
+            "silhouette_clusters": sil_clusters,
+        }
+
+        # compare to each obs_key
+        for obs in obs_keys:
+            true_labels = lrdata.obs[obs].astype(str).values[mask.values]
+            if len(true_labels) == 0:
+                nmi = ami = hom = ari = np.nan
+            else:
+                nmi = normalized_mutual_info_score(true_labels, labels)
+                ami = adjusted_mutual_info_score(true_labels, labels)
+                hom = homogeneity_score(true_labels, labels)
+                ari = adjusted_rand_score(true_labels, labels)
+            row.update(
+                {
+                    f"nmi_vs_{obs}": float(nmi),
+                    f"ami_vs_{obs}": float(ami),
+                    f"homogeneity_vs_{obs}": float(hom),
+                    f"ari_vs_{obs}": float(ari),
+                }
+            )
+
+        # include baselines
+        row.update(baselines)
+        results.append(row)
+
+    results_df = pd.DataFrame(results)
+    csv_path = outdir / "clustering_metrics.csv"
+    results_df.to_csv(csv_path, index=False)
+    out["results_df"] = results_df
+    out["clustering_csv"] = str(csv_path)
+
+    # 3) Plot metrics (similar to notebook)
+    sns.set(style="whitegrid")
+    # prepare dynamic plots: spatial coherence, silhouette, and for each metric type across obs_keys
+    metric_specs = []
+    metric_specs.append(
+        {"title": "Spatial coherence (clusters) vs baselines", "cols": ["spatial_coherence_clusters_k3"], "baselines": [(f"baseline_spatial_coherence_{obs_keys[0]}", f"baseline - {obs_keys[0]}")] if obs_keys else []}
+    )
+    metric_specs.append(
+        {"title": "Silhouette (clusters) vs baselines", "cols": ["silhouette_clusters"], "baselines": [(f"baseline_silhouette_{obs_keys[0]}", f"baseline - {obs_keys[0]}")] if obs_keys else []}
+    )
+    # add NMI/AMI/Hom/ARI with all provided obs_keys
+    for metric_name in ["nmi", "ami", "homogeneity", "ari"]:
+        cols = [f"{metric_name}_vs_{obs}" for obs in obs_keys]
+        bas = []
+        # add pair baseline if exists (first two)
+        if len(obs_keys) >= 2 and f"baseline_{metric_name}_{obs_keys[0]}_vs_{obs_keys[1]}" in baselines:
+            bas = [(f"baseline_{metric_name}_{obs_keys[0]}_vs_{obs_keys[1]}", f"baseline ({obs_keys[0]} vs {obs_keys[1]})")]
+        metric_specs.append({"title": f"{metric_name.upper()}: cluster vs true labels", "cols": cols, "baselines": bas})
+
+    # create combined figure
+    n_plots = len(metric_specs)
+    ncols = 2
+    nrows = (n_plots + 1) // ncols
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, 4 * nrows), squeeze=False)
+    baseline_colors = ["gray", "black", "tab:orange", "tab:green"]
+    baseline_linestyles = ["--", ":", "-.", "-"]
+
+    for i, spec in enumerate(metric_specs):
+        ax = axes[i // ncols, i % ncols]
+        for col in spec["cols"]:
+            if col in results_df.columns:
+                ax.plot(results_df["n_clusters"], results_df[col], marker="o", label=col)
+        for j, (bl_col, bl_label) in enumerate(spec.get("baselines", [])):
+            if bl_col in results_df.columns:
+                bl_val = float(results_df[bl_col].iloc[0])
+                color = baseline_colors[j % len(baseline_colors)]
+                ls = baseline_linestyles[j % len(baseline_linestyles)]
+                ax.axhline(bl_val, color=color, linestyle=ls, linewidth=1.5, label=bl_label)
+        ax.set_xlabel("n_clusters")
+        ax.set_xticks(results_df["n_clusters"])
+        ax.set_title(spec["title"])
+        ax.legend(loc="best", fontsize="small")
+        ax.grid(axis="y", linestyle=":", alpha=0.6)
+
+    # hide unused axes
+    total_axes = nrows * ncols
+    for j in range(n_plots, total_axes):
+        fig.delaxes(axes[j // ncols, j % ncols])
+
+    fig.tight_layout()
+    metrics_path = outdir / "clustering_metrics_summary.png"
+    fig.savefig(metrics_path, dpi=150)
+    plt.close(fig)
+    out["clustering_metrics_plot"] = str(metrics_path)
+
+    # 4) Weight distributions and model diagnostics
     try:
         weights_dict = model.get_weights()
-        plt.figure(figsize=(12, 6))
+        fig = plt.figure(figsize=(8, 5))
         for key, df in weights_dict.items():
             values = df.values.flatten()
-            sns.kdeplot(values, label=key, fill=False)
+            sns.kdeplot(values, label=str(key), fill=False)
         plt.title("Distribution of Weights per View")
         plt.xlabel("Weight Value")
         plt.ylabel("Density")
         plt.legend(title="View/Key", bbox_to_anchor=(1.05, 1), loc="upper left")
         plt.tight_layout()
-        p = out_dir / "weights_distribution.png"
-        plt.savefig(p, bbox_inches="tight", dpi=150)
-        plt.close()
-        return str(p)
-    except Exception as e:
-        return {"error": str(e)}
-# Cell 6: Logistic regression on factor space
-def classification_on_factors(factors, lrdata, output_dir, classification_label_key=None,
-                              test_size=0.3, random_state=42):
-    
-    out_dir = _ensure_dir(output_dir)
+        wpath = outdir / "weights_distribution.png"
+        fig.savefig(wpath, dpi=150)
+        plt.close(fig)
+        out["weights_distribution"] = str(wpath)
+    except Exception:
+        out["weights_distribution"] = None
 
-    obskey1 = lrdata.obs[classification_label_key]
-    factors = factors.copy()
-    factors["anno"] = obskey1.reindex(factors.index)
-    factors = factors.dropna()
-
-    drop_cols = [c for c in ["cluster", "anno"] if c in factors.columns]
-    X = factors.drop(columns=drop_cols).values
-    y = factors["anno"].values
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y)
-
-    clf = LogisticRegression(solver="lbfgs", max_iter=200, class_weight="balanced")
-    clf.fit(X_train, y_train)
-
-    y_pred = clf.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    cls_report = classification_report(y_test, y_pred, output_dict=True)
-
-    cm = confusion_matrix(y_test, y_pred)
-    pd.DataFrame(cm, index=clf.classes_, columns=clf.classes_).to_csv(out_dir / "confusion_matrix.csv")
-
+    # --- Factor correlation (library-agnostic) ---
     try:
-        y_proba = clf.predict_proba(X_test)
-        auc_macro = roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro")
-        auc_weighted = roc_auc_score(y_test, y_proba, multi_class="ovr", average="weighted")
-    except:
-        auc_macro = np.nan
-        auc_weighted = np.nan
+        fac = model.get_factors()[group].copy()  # cells x factors (columns are factors)
+        # Ensure fac is a DataFrame
+        if not isinstance(fac, pd.DataFrame):
+            fac = pd.DataFrame(fac)
+        corr = fac.corr(method="pearson")  # factor-factor correlation
 
-    metrics = {
-        "accuracy": acc,
-        "auc_macro": auc_macro,
-        "auc_weighted": auc_weighted,
-        "classification_report": cls_report,
-    }
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(corr.values, aspect="auto", interpolation="nearest")
+        ax.set_xticks(range(corr.shape[1]))
+        ax.set_xticklabels(corr.columns, rotation=90)
+        ax.set_yticks(range(corr.shape[0]))
+        ax.set_yticklabels(corr.index)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Pearson r")
+        ax.set_title("Factor Correlation")
+        fig.tight_layout()
 
-    pd.DataFrame(cls_report).to_csv(out_dir / "classification_report.csv")
-    return metrics, str(out_dir / "classification_report.csv")
-# Cell 5: Clustering sweep (cleanest output, full annotation metrics)
-def clustering_sweep(
-    factors,
-    lrdata_sub,
-    output_dir,
-    n_clusters_list=None,
-    spatial_k_for_scs=3,
-    obs_keys=None,
-    spatial_key="spatial",
-):
+        fpath = outdir / "factor_correlation.png"
+        fig.savefig(fpath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        out["factor_correlation"] = str(fpath)
+    except Exception:
+        out["factor_correlation"] = None
 
-    out_dir = _ensure_dir(output_dir)
+# --- Variance explained heatmap: factors (rows) x views (cols) for group_1 ---
+    try:
+        ve_mat = model.get_r2(ordered=True)["group_1"]  # rows=factors, cols=views
+        if isinstance(ve_mat, pd.Series):
+            ve_mat = ve_mat.to_frame()
+        ve_mat = ve_mat.apply(pd.to_numeric, errors="coerce")
+        vmax = float(np.nanmax(ve_mat.values)) if np.isfinite(ve_mat.values).any() else 1.0
 
-    if n_clusters_list is None:
-        n_clusters_list = list(range(2, 10))
-    if obs_keys is None:
-        obs_keys = []
+        # Scale figure size to content
+        fig_w = max(6, 0.48 * ve_mat.shape[1])
+        fig_h = max(5, 0.42 * ve_mat.shape[0])
 
-    # Drop non-factor columns
-    drop_cols = [c for c in ["cluster", "anno"] if c in factors.columns]
-    X_f = factors.drop(columns=drop_cols)
-    X_std = StandardScaler().fit_transform(X_f.values)
-
-    # Validate spatial key
-    if spatial_key not in lrdata_sub.obsm:
-        raise KeyError(
-            f"spatial_key '{spatial_key}' not found in lrdata_sub.obsm. "
-            f"Available keys: {list(lrdata_sub.obsm.keys())}"
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        im = ax.imshow(
+            ve_mat.values,
+            aspect="auto",
+            cmap="Reds_r",   # lighter = higher variance (as in your example)
+            vmin=0.0,
+            vmax=vmax,
+            interpolation="nearest",
         )
 
-    X_spatial = lrdata_sub.obsm[spatial_key]
+        # Ticks & labels
+        ax.set_xticks(np.arange(ve_mat.shape[1]))
+        ax.set_xticklabels(ve_mat.columns, rotation=90)
+        ax.set_yticks(np.arange(ve_mat.shape[0]))
+        ax.set_yticklabels(ve_mat.index)
 
-    # Ensure same ordering
-    common_idx = factors.index.intersection(lrdata_sub.obs_names)
-    if not list(common_idx) == list(lrdata_sub.obs_names):
-        X_spatial = lrdata_sub.obsm[spatial_key][
-            [lrdata_sub.obs_names.get_loc(i) for i in common_idx], :
-        ]
+        # Title strip & colorbar like the example
+        ax.set_title("group_1", pad=10)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.08)
+        cbar.set_label("Variance explained")
 
-    # Obs label arrays
-    obs_arrays = {
-        key: (lrdata_sub.obs[key].astype(str).values if key in lrdata_sub.obs else None)
-        for key in obs_keys
-    }
+        fig.tight_layout()
+        vpath = outdir / "variance_explained.png"
+        fig.savefig(vpath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        out["variance_explained"] = str(vpath)
+    except Exception:
+        out["variance_explained"] = None
 
-    # ---------------------- STATIC LABEL METRICS ----------------------
-
-    # Spatial coherence of true labels
-    obs_static_scores = {}
-    for key, arr in obs_arrays.items():
-        if arr is not None:
-            obs_static_scores[key] = float(
-                spatial_coherence_score(X_spatial, arr, k=spatial_k_for_scs)
-            )
-        else:
-            obs_static_scores[key] = float("nan")
-
-    static_df = pd.DataFrame(
-        [{"obs_key": k, "spatial_coherence_score": v} for k, v in obs_static_scores.items()]
-    )
-    static_csv = out_dir / "annotation_static_metrics.csv"
-    static_df.to_csv(static_csv, index=False)
-
-    # Silhouette of true labels in factor space
-    silhouette_scores_true = {}
-    for key, arr in obs_arrays.items():
-        try:
-            silhouette_scores_true[key] = float(silhouette_score(X_spatial, arr))
-        except:
-            silhouette_scores_true[key] = float("nan")
-
-    sil_df = pd.DataFrame([silhouette_scores_true])
-    sil_csv = out_dir / "annotation_silhouette_scores.csv"
-    sil_df.to_csv(sil_csv, index=False)
-
-    # Pairwise consistency between annotation keys
-    pairwise_scores = []
-    obs_keys_list = list(obs_arrays.keys())
-    for i in range(len(obs_keys_list)):
-        for j in range(i + 1, len(obs_keys_list)):
-            k1, k2 = obs_keys_list[i], obs_keys_list[j]
-            arr1, arr2 = obs_arrays[k1], obs_arrays[k2]
-
-            if arr1 is None or arr2 is None:
-                continue
-
-            pairwise_scores.append({
-                "obs_key_1": k1,
-                "obs_key_2": k2,
-                "nmi": float(normalized_mutual_info_score(arr1, arr2)),
-                "ami": float(adjusted_mutual_info_score(arr1, arr2)),
-                "hom": float(homogeneity_score(arr1, arr2)),
-                "ari": float(adjusted_rand_score(arr1, arr2)),
-            })
-
-    pairwise_df = pd.DataFrame(pairwise_scores)
-    pairwise_csv = out_dir / "annotation_pairwise_metrics.csv"
-    pairwise_df.to_csv(pairwise_csv, index=False)
-
-    # ---------------------- CLUSTERING SWEEP ----------------------
-    results = []
-    for k in n_clusters_list:
-        km = KMeans(n_clusters=k, random_state=42)
-        labels = km.fit_predict(X_std)
-
-        row = {"n_clusters": k}
-
-        # Silhouette over spatial coordinates
-        try:
-            row["silhouette_spatial"] = float(silhouette_score(X_spatial, labels))
-        except:
-            row["silhouette_spatial"] = float("nan")
-
-        # Cluster vs annotation agreement
-        for key, arr in obs_arrays.items():
-            pref = key.replace(" ", "_")
-
-            if arr is None:
-                row[f"nmi_cluster_{pref}"] = float("nan")
-                row[f"ami_cluster_{pref}"] = float("nan")
-                row[f"hom_cluster_{pref}"] = float("nan")
-                row[f"ari_cluster_{pref}"] = float("nan")
-                continue
-
-            try:
-                row[f"nmi_cluster_{pref}"] = float(normalized_mutual_info_score(arr, labels))
-            except Exception:
-                row[f"nmi_cluster_{pref}"] = float("nan")
-
-            try:
-                row[f"ami_cluster_{pref}"] = float(adjusted_mutual_info_score(arr, labels))
-            except Exception:
-                row[f"ami_cluster_{pref}"] = float("nan")
-
-            try:
-                row[f"hom_cluster_{pref}"] = float(homogeneity_score(arr, labels))
-            except Exception:
-                row[f"hom_cluster_{pref}"] = float("nan")
-
-            try:
-                row[f"ari_cluster_{pref}"] = float(adjusted_rand_score(arr, labels))
-            except Exception:
-                row[f"ari_cluster_{pref}"] = float("nan")
-
-        # Cluster spatial coherence
-        try:
-            row["spatial_coherence_score_cluster"] = float(
-                spatial_coherence_score(X_spatial, labels, k=spatial_k_for_scs)
-            )
-        except:
-            row["spatial_coherence_score_cluster"] = float("nan")
-
-        results.append(row)
-
-    results_df = pd.DataFrame(results).set_index("n_clusters").sort_index()
-    sweep_csv = out_dir / "clustering_metrics_sweep.csv"
-    results_df.to_csv(sweep_csv)
-
-    return (
-        results_df,
-        obs_static_scores,
-        str(sweep_csv),
-        str(static_csv),
-        pairwise_scores,
-        str(pairwise_csv),
-        silhouette_scores_true,
-        str(sil_csv),
-    )
-
-# Cell 7: Full pipeline
-def evaluate_pipeline(model, lrdata, output_dir, group="group_1",
-                      n_clusters_list=None, obs_keys=None, classification_label_key=None, spatial_key="spatial"):
-
-    out_dir = _ensure_dir(output_dir)
-    plots_dir = _ensure_dir(out_dir / "plots")
-    stats_dir = _ensure_dir(out_dir / "stats")
-
-    if obs_keys is None or len(obs_keys) == 0:
-        raise ValueError("obs_keys must be provided")
-
-    if classification_label_key is None:
-        raise ValueError("classification_label_key must be provided, it is the ground truth label for classification")
-
-    # Model plots & R2
-    mofa_results = evaluate_single_mofa_model(model, plots_dir, group=group)
-    _ = plot_weights_distribution(model, plots_dir)
-
-    # Extract factors
-    factors = model.get_factors()[group]
-
-    # Clean AnnData
-    lrdata_clean = lrdata.copy()
-    for key in obs_keys:
-        if key in lrdata_clean.obs:
-            lrdata_clean = lrdata_clean[~lrdata_clean.obs[key].isna()].copy()
-
-    # Align indices
-    common_idx = factors.index.intersection(lrdata_clean.obs_names)
-    factors_sub = factors.loc[common_idx].copy()
-    lrdata_sub = lrdata_clean[common_idx, :].copy()
-
-    # Classification
+    # save R2 summary if available
     try:
-        class_metrics, class_report_path = classification_on_factors(
-            factors_sub, lrdata_sub, stats_dir,
-            classification_label_key=classification_label_key
+        r2 = model.get_r2(total=True)
+        r2_path = outdir / "r2_summary.csv"
+        r2.to_csv(r2_path)
+        out["r2_summary"] = str(r2_path)
+    except Exception:
+        out["r2_summary"] = None
+
+    # 5) Classification (optional)
+    if classification_key is not None:
+        # build factors with annotation, drop NaNs
+        fac = model.get_factors()[group].copy()
+        fac["anno"] = lrdata.obs[classification_key].reindex(fac.index)
+        fac = fac.dropna(subset=["anno"])
+        Xc = fac.drop(columns=["anno"]).values
+        y = fac["anno"].values
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            Xc, y, test_size=0.3, random_state=random_state, stratify=y
         )
-    except Exception as e:
-        class_metrics = {"error": str(e)}
-        class_report_path = ""
+        clf = LogisticRegression(solver="lbfgs", max_iter=2000, class_weight="balanced", multi_class="multinomial")
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        crep = classification_report(y_test, y_pred, output_dict=False)
+        # save report
+        report_path = outdir / "classification_report.txt"
+        with open(report_path, "w") as fh:
+            fh.write(f"Accuracy: {acc:.4f}\n\n")
+            fh.write(crep)
+        out["classification_report"] = str(report_path)
 
-    # Clustering analysis (NEW expanded returns)
-    (
-        clustering_df,
-        static_scores,
-        clustering_csv,
-        static_csv,
-        pairwise_scores,
-        pairwise_csv,
-        silhouette_scores_true,
-        silhouette_csv
-    ) = clustering_sweep(
-        factors_sub, lrdata_sub, stats_dir,
-        n_clusters_list=n_clusters_list,
-        obs_keys=obs_keys,
-        spatial_key=spatial_key
-    )
+        # confusion matrix plot
+        cm = confusion_matrix(y_test, y_pred, labels=clf.classes_)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt="d", ax=ax, cmap="Blues", xticklabels=clf.classes_, yticklabels=clf.classes_)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_title("Confusion matrix")
+        cm_path = outdir / "confusion_matrix.png"
+        fig.savefig(cm_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        out["confusion_matrix"] = str(cm_path)
 
-    # Summary table
-    summary = {
-        "mean_r2": mofa_results.get("mean_r2", np.nan),
-        "classification_accuracy": class_metrics.get("accuracy", np.nan),
-        "classification_auc_macro": class_metrics.get("auc_macro", np.nan),
-        "classification_auc_weighted": class_metrics.get("auc_weighted", np.nan),
-        "clustering_csv": clustering_csv,
-        "static_annotation_metrics_csv": static_csv,
-        "annotation_pairwise_csv": pairwise_csv,
-        "annotation_silhouette_csv": silhouette_csv,
-        "used_obs_keys": ",".join(obs_keys),
-        "used_label_key_for_classification": classification_label_key,
-    }
+        # multiclass ROC AUC (OvR) if possible
+        try:
+            y_proba = clf.predict_proba(X_test)
+            auc_macro = roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro")
+            auc_weighted = roc_auc_score(y_test, y_proba, multi_class="ovr", average="weighted")
+            out["classification_auc_macro"] = float(auc_macro)
+            out["classification_auc_weighted"] = float(auc_weighted)
+            # save numeric summary
+            with open(outdir / "classification_metrics.json", "w") as fh:
+                json.dump({"accuracy": float(acc), "auc_macro": float(auc_macro), "auc_weighted": float(auc_weighted)}, fh)
+        except Exception:
+            out["classification_auc_macro"] = None
+            out["classification_auc_weighted"] = None
 
-    # Add static spatial coherence
-    for key, value in static_scores.items():
-        summary[f"spatial_coherence_{key}"] = value
-
-    # Add silhouette of true labels in factor space
-    for key, value in silhouette_scores_true.items():
-        summary[f"silhouette_true_{key}"] = value
-
-    # Save summary CSV
-    # The output CSV "summary_metrics.csv" contains a single row with the following columns:
-    # - mean_r2: Mean R2 value from the MOFA model for the specified group.
-    # - classification_accuracy: Accuracy of logistic regression classification on factor space.
-    # - classification_auc_macro: Macro-averaged AUC for classification.
-    # - classification_auc_weighted: Weighted-averaged AUC for classification.
-    # - clustering_csv: Path to the clustering metrics sweep CSV.
-    # - static_annotation_metrics_csv: Path to the static annotation metrics CSV.
-    # - annotation_pairwise_csv: Path to the annotation pairwise metrics CSV.
-    # - annotation_silhouette_csv: Path to the annotation silhouette scores CSV.
-    # - used_obs_keys: Comma-separated list of observation keys used.
-    # - used_label_key_for_classification: The label key used for classification.
-    # - spatial_coherence_{key}: Spatial coherence score for each obs key.
-    # - silhouette_true_{key}: Silhouette score of true labels in factor space for each obs key.
-    pd.DataFrame([summary]).to_csv(stats_dir / "summary_metrics.csv", index=False)
-
-    return {
-        "summary": summary,
-        "clustering": clustering_df,
-        "classification_metrics": class_metrics,
-        "spatial_coherence_scores": static_scores,
-        "pairwise_scores": pairwise_scores,
-        "silhouette_scores_true": silhouette_scores_true,
-        "class_report": class_report_path,
-        "plots_dir": str(plots_dir),
-        "stats_dir": str(stats_dir),
-    }
+    return out

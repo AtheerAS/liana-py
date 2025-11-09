@@ -1,3 +1,3 @@
-from .Evaluate_mofa_flex_models import evaluate_pipeline
-from .Plot_models_eval_results import plot_model_metrics
-from .Plot_models_eval_results import summarize_cluster_spatial_metrics
+from .Evaluate_mofa_flex_models import evaluate_mofaflex
+from .Plot_models_eval_results import spatial_statistics_summary_plot
+from .Plot_models_eval_results import model_performance_summary_plot
